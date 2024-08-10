@@ -4,14 +4,21 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-2022, macos-11, ubuntu-22.04]
+        os: [windows-2022, macos-12, ubuntu-22.04]
         addrsize: ["64"]
-        include:
-          - os: windows-2022
-            addrsize: "32"
     continue-on-error: false
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Setup Homebrew Packages
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: brew install ninja
+      - name: Setup Apt Packages
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build
       - uses: secondlife/action-autobuild@v4
         with:
           addrsize: ${{ matrix.addrsize }}

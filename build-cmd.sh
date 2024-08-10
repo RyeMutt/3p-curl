@@ -13,7 +13,7 @@ if [ -z "$AUTOBUILD" ] ; then
     exit 1
 fi
 
-if [ "$OSTYPE" = "cygwin" ] ; then
+if [[ "$OSTYPE" == "cygwin" || "$OSTYPE" == "msys" ]] ; then
     # need igncr so cygwin bash will trim both '\r\n' from $(command)
     set -o igncr
     autobuild="$(cygpath -u $AUTOBUILD)"
@@ -149,14 +149,16 @@ mkdir -p "$CURL_BUILD_DIR"
 pushd "$CURL_BUILD_DIR"
     case "$AUTOBUILD_PLATFORM" in
         windows*)
-        
+            opts="$(replace_switch /Zi /Z7 $LL_BUILD_RELEASE) -DNGHTTP2_STATICLIB=1"
+            plainopts="$(remove_switch /GR $(remove_cxxstd $opts))"
+
             packages="$(cygpath -m "$stage/packages")"
             load_vsvars
 
             cmake "$(cygpath -m "${CURL_SOURCE_DIR}")" \
                 -G"$AUTOBUILD_WIN_CMAKE_GEN" -A"$AUTOBUILD_WIN_VSPLATFORM" \
-                -DCMAKE_C_FLAGS:STRING="$LL_BUILD_RELEASE" \
-                -DCMAKE_CXX_FLAGS:STRING="$LL_BUILD_RELEASE" \
+                -DCMAKE_C_FLAGS:STRING="$plainopts" \
+                -DCMAKE_CXX_FLAGS:STRING="$opts" \
                 -DENABLE_THREADED_RESOLVER:BOOL=ON \
                 -DCMAKE_USE_OPENSSL:BOOL=TRUE \
                 -DUSE_NGHTTP2:BOOL=TRUE \
@@ -166,32 +168,23 @@ pushd "$CURL_BUILD_DIR"
 
             check_damage "$AUTOBUILD_PLATFORM"
 
-            build_sln "CURL.sln" "Release|$AUTOBUILD_WIN_VSPLATFORM" ## "Install"
+            cmake --build . --config Release -j$AUTOBUILD_CPU_COUNT
+            cmake --install . --config Release
             
             # conditionally run unit tests
             if [ "${DISABLE_UNIT_TESTS:-0}" = "0" ]; then
                 pushd tests
                 # Nothin' to do yet
-
                 popd
             fi
 
-            # stage header files
-            cp -R "$LIBCURL_HEADER_DIR" "${stage}/"
-
             # Stage archives
             mkdir -p "${stage}/lib/release"
-            mv "lib/Release/libcurl.lib" "${stage}"/lib/release/
-
-#           # Stage curl.exe and provide .dll's it needs
-            curldir="src/Release"
-##          mkdir -p "${stage}"/bin
-            cp -af "${stage}"/packages/lib/release/*.dll "$curldir/"
-            chmod +x-w "$curldir"/*.dll   # correct package permissions
+            mv "${stage}/lib/libcurl.lib" "${stage}"/lib/release/
 
             # Run 'curl' as a sanity check. Capture just the first line, which
             # should have versions of stuff.
-            curlout="$("$curldir/curl.exe" --version | head -n 1)"
+            curlout="$("${stage}/bin/curl.exe" --version | head -n 1)"
             # With -e in effect, any nonzero rc blows up the script --
             # so plain 'expr str : pattern' asserts that str contains pattern.
             # curl version - should be start of line
@@ -201,10 +194,12 @@ pushd "$CURL_BUILD_DIR"
             # OpenSSL/version
             expr "$curlout" : ".* OpenSSL/$(escape_dots "$(get_installable_version openssl 3)")" > /dev/null
             # zlib/version
-            expr "$curlout" : ".* zlib/$(escape_dots "$(get_installable_version zlib-ng 3)")" > /dev/null
+            expr "$curlout" : ".* zlib/" > /dev/null
         ;;
 
         darwin*)
+            export MACOSX_DEPLOYMENT_TARGET="$LL_BUILD_DARWIN_DEPLOY_TARGET"
+
             opts="${TARGET_OPTS:--arch $AUTOBUILD_CONFIGURE_ARCH $LL_BUILD_RELEASE}"
             opts="$(set_target $opts)"
             plainopts="$(remove_cxxstd $opts)"
@@ -236,20 +231,24 @@ pushd "$CURL_BUILD_DIR"
             # CMakeLists.txt that doesn't work with the Xcode "new build
             # system." Possibly a newer version of curl will fix.
             # https://stackoverflow.com/a/65474688
-            cmake "${CURL_SOURCE_DIR}" -G Xcode -T buildsystem=1 \
+            cmake "${CURL_SOURCE_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_C_FLAGS:STRING="$plainopts" \
-                -DCMAKE_CXX_FLAGS:STRING="$opts" -D'BUILD_SHARED_LIBS:bool=off' \
+                -DCMAKE_CXX_FLAGS:STRING="$opts" \
+                -DBUILD_SHARED_LIBS:BOOL=OFF \
                 -DENABLE_THREADED_RESOLVER:BOOL=ON \
                 -DCMAKE_USE_OPENSSL:BOOL=TRUE \
                 -DUSE_NGHTTP2:BOOL=TRUE \
                 -DNGHTTP2_INCLUDE_DIR:FILEPATH="$stage/packages/include" \
-                -DNGHTTP2_LIBRARY:FILEPATH="$stage/packages/lib/release/libnghttp2.dylib" \
-                -D'BUILD_CODEC:bool=off' -DCMAKE_INSTALL_PREFIX=$stage
+                -DNGHTTP2_LIBRARY:FILEPATH="$stage/packages/lib/release/libnghttp2.a" \
+                -DCMAKE_INSTALL_PREFIX=$stage \
+                -DCMAKE_OSX_ARCHITECTURES="x86_64" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}
 
             check_damage "$AUTOBUILD_PLATFORM"
 
-            xcodebuild -configuration Release -target libcurl -project CURL.xcodeproj
-            xcodebuild -configuration Release -target install -project CURL.xcodeproj
+            cmake --build . --config Release -j$AUTOBUILD_CPU_COUNT
+            cmake --install . --config Release
+
             mkdir -p "$stage/lib/release"
             mv "$stage/lib/libcurl.a" "$stage/lib/release/libcurl.a"
 
@@ -273,6 +272,22 @@ pushd "$CURL_BUILD_DIR"
 #            make distclean
             # Again, for dylib dependencies
             # rm -rf Resources/ ../Resources tests/Resources/
+
+            # Run 'curl' as a sanity check. Capture just the first line, which
+            # should have versions of stuff.
+            curlout="$("${stage}"/bin/curl --version | tr -d '\r' | head -n 1)"
+            # With -e in effect, any nonzero rc blows up the script --
+            # so plain 'expr str : pattern' asserts that str contains pattern.
+            # curl version - should be start of line
+            expr "$curlout" : "curl $(escape_dots "$version")" > /dev/null
+            # libcurl/version
+            expr "$curlout" : ".* libcurl/$(escape_dots "$version")" > /dev/null
+            # OpenSSL/version
+            expr "$curlout" : ".* OpenSSL/$(escape_dots "$(get_installable_version openssl 3)")" > /dev/null
+            # zlib/version
+            expr "$curlout" : ".* zlib/" > /dev/null
+            # nghttp2/versionx
+            expr "$curlout" : ".* nghttp2/$(escape_dots "$(get_installable_version nghttp2 3)")" > /dev/null
         ;;
 
         linux*)
@@ -313,19 +328,22 @@ pushd "$CURL_BUILD_DIR"
             # Release configure and build
             export LD_LIBRARY_PATH="${stage}"/packages/lib/release:"$saved_path"
 
-            cmake "${CURL_SOURCE_DIR}" -G"Unix Makefiles" \
-                -DCMAKE_C_FLAGS:STRING="$plainopts" -DCMAKE_CXX_FLAGS:STRING="$opts" \
+            cmake "${CURL_SOURCE_DIR}" -G"Ninja" -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS:STRING="$plainopts" \
+                -DCMAKE_CXX_FLAGS:STRING="$opts" \
                 -DENABLE_THREADED_RESOLVER:BOOL=ON \
                 -DCMAKE_USE_OPENSSL:BOOL=TRUE \
                 -DUSE_NGHTTP2:BOOL=TRUE \
                 -DNGHTTP2_INCLUDE_DIR:FILEPATH="$stage/packages/include" \
                 -DNGHTTP2_LIBRARY:FILEPATH="$stage/packages/lib/release/libnghttp2.a" \
-                -DBUILD_SHARED_LIBS:bool=off -DCMAKE_INSTALL_PREFIX=$stage
+                -DBUILD_SHARED_LIBS:BOOL=FALSE \
+                -DCMAKE_INSTALL_PREFIX=$stage
             
             check_damage "$AUTOBUILD_PLATFORM"
 
-            make
-            make install
+            cmake --build . --config Release -j$AUTOBUILD_CPU_COUNT
+            cmake --install . --config Release
+
             mkdir -p "$stage/lib/release"
             mv "$stage/lib/libcurl.a" "$stage/lib/release/libcurl.a"
 
@@ -342,6 +360,22 @@ pushd "$CURL_BUILD_DIR"
 #                    make quiet-test TEST_Q='-n !906 !530 !564 !584 !1026'
 #                popd
 #            fi
+
+            # Run 'curl' as a sanity check. Capture just the first line, which
+            # should have versions of stuff.
+            curlout="$("${stage}"/bin/curl --version | tr -d '\r' | head -n 1)"
+            # With -e in effect, any nonzero rc blows up the script --
+            # so plain 'expr str : pattern' asserts that str contains pattern.
+            # curl version - should be start of line
+            expr "$curlout" : "curl $(escape_dots "$version")" > /dev/null
+            # libcurl/version
+            expr "$curlout" : ".* libcurl/$(escape_dots "$version")" > /dev/null
+            # OpenSSL/version
+            expr "$curlout" : ".* OpenSSL/$(escape_dots "$(get_installable_version openssl 3)")" > /dev/null
+            # zlib/version
+            expr "$curlout" : ".* zlib/" > /dev/null
+            # nghttp2/versionx
+            expr "$curlout" : ".* nghttp2/$(escape_dots "$(get_installable_version nghttp2 3)")" > /dev/null
 
             export LD_LIBRARY_PATH="$saved_path"
         ;;
